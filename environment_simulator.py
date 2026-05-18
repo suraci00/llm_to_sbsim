@@ -354,9 +354,10 @@ def resolve_device_from_context(device_id, point_name, devices):
     if device_id in devices: # se ha già trovato il device -> OK
         return device_id
 
+
     raw_device = str(device_id or "").strip().lower()
     point_name = point_name or ""
-
+    
     if point_name: #cerca i devices con il setpoint/measurement individuato
         candidates = [
             d for d, info in devices.items()
@@ -453,18 +454,8 @@ def esegui_tools(building, devices, zone_map, tool_name: str, args: dict) -> dic
 
 
 def build_system_prompt() -> str:
-    base_prompt = prompts.prompt_funcalling_lowlevelwithcontext()
-    extra_rules = """
-
-    Regole aggiuntive per SBSim e function calling:
-    - Non inventare mai device_id completi. Se conosci solo il tipo, usa nomi generici come boiler, caldaia, ahu, air handler o vav: il backend li risolverà.
-    - Non usare default_zone_id come device_id: le zone non sono device.
-    - Per leggere un setpoint usa read_point con measurement_name uguale al nome del setpoint.
-    - Per modificare un setpoint usa write_point.
-    - Se l'utente dice supply water setpoint del boiler, usa device_id boiler e measurement_name supply_water_setpoint.
-    - Se l'utente dice damper o serranda di un VAV, usa supply_air_damper_percentage_command.
-    """
-    return base_prompt + extra_rules
+    base_prompt = prompts.prompt_funcalling_basic()
+    return base_prompt
 
 
 def interpreta_prompt(user_text: str, system_prompt: str, building, devices, zone_map):
@@ -479,6 +470,10 @@ def interpreta_prompt(user_text: str, system_prompt: str, building, devices, zon
             {"role": "user", "content": user_text},
         ],
         tools=TOOLS,
+        options={
+            "temperature": 0, #diminuisce la casualità
+            "top_p": 1 #esplora tutte le possibilità
+        }
     )
 
     dt = time.time() - t0
@@ -735,7 +730,7 @@ def make_initial_action(env) -> np.ndarray:
     return np.zeros(shape, dtype=dtype)
 
 
-def set_current_action_from_native_value(env, current_action: np.ndarray, device_id: str, setpoint_name: str, native_value: float) -> Optional[dict]:
+def set_current_action(env, current_action: np.ndarray, device_id: str, setpoint_name: str, native_value: float) -> Optional[dict]:
     action_mapping = get_action_mapping(env) # Recupero la mappa dei setpoint controllabili da agente
     key = (device_id, setpoint_name) #creo chiave per cercare setpoint
     info = action_mapping.get(key) #cerco setpoint nella mappa con la chiave
@@ -794,21 +789,23 @@ def apply_user_overrides(building, user_overrides): # Applico l'override appena 
     for (device_id, setpoint_name), value in user_overrides.items():
         try:
             device = device_map[device_id]
-            device.set_action(setpoint_name, float(value), building.current_timestamp)
+            device.set_action(setpoint_name, float(value), building.current_timestamp) #imposto valore setpoint richiesto direttamente sul device
             print(f"Override diretto riapplicato: {device_id} | {setpoint_name} = {value}")
         except Exception as e:
             print(f"[WARN] Override diretto non applicato: {device_id} | {setpoint_name} = {value} | {e}")
 
 
 def apply_setpoint_change(env, building, user_overrides: dict, current_action: np.ndarray, write_result: dict) -> dict:
+    FORCE_OVERRIDE_MODE = False #flag di test per abilitare/disabilitare canale agente RL (False -> abilitato, True -> disabilitato)
+
     #applica modifica richiesta dall'utente (tramite action vector o override)
     device_id = write_result["device_id"]
     setpoint_name = write_result["setpoint_name"]
     value = float(write_result["requested_value"])
 
     # se possibile uso action vector, altrimenti applico overrides manuali
-    action_update = set_current_action_from_native_value(env, current_action, device_id, setpoint_name, value)
-    if action_update is not None:
+    action_update = set_current_action(env, current_action, device_id, setpoint_name, value)
+    if action_update is not None and not FORCE_OVERRIDE_MODE:
         user_overrides.pop((device_id, setpoint_name), None)
         channel = action_update["channel"]
         agent_value = action_update["agent_value"]
@@ -916,7 +913,7 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
 
     #applico gli overrides effettuati in precedenza prima di leggere o scrivere 
     user_overrides = {}
-    setattr(building, "_user_runtime_overrides", user_overrides)
+    setattr(building, "_user_runtime_overrides", user_overrides) #aggiungo attributo al building per salvare gli overrides
     apply_previous_overrides(building)
 
     steps = int(env.steps_per_episode)
@@ -939,10 +936,97 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
     total_gas_kwh = 0.0
     sum_avg_temp_c = 0.0
 
+    predefined_inputs = [
+        # 1. Discovery generale
+        "Quali device sono disponibili nel sistema?",
+        "Quali sensori sono disponibili nel sistema?",
+        "Mostrami zone, device, setpoint e measurement disponibili",
+        "Fammi vedere la struttura dell'edificio simulato",
+        "Quali attuatori posso controllare?",
+
+        # 2. Letture esplicite corrette
+        "Dimmi supply_water_setpoint del boiler",
+        "Leggi supply_water_temperature_sensor del boiler",
+        "Leggi supply_air_flowrate_sensor dell'AHU",
+        "Dimmi outside_air_flowrate_sensor della centrale aria",
+        "Leggi cooling_request_count dell'air handler",
+        "Dimmi zone_air_temperature_sensor di vav_room_1",
+        "Leggi supply_air_damper_percentage_command di vav_room_10",
+
+        # 3. Letture semantiche corrette
+        "Qual è la temperatura della stanza 3?",
+        "Dimmi la temperatura della zona 10",
+        "Quanto è calda la stanza 25?",
+        "Leggi la temperatura ambiente della zona 7",
+        "Dimmi il valore della serranda della stanza 12",
+        "Qual è l'apertura della serranda in zona 4?",
+        "Dimmi il setpoint dell'acqua calda prodotta dal boiler",
+        "Qual è il target di raffreddamento dell'aria centrale?",
+        "Qual è il target di riscaldamento dell'aria immessa?",
+        "Dimmi quante richieste di raffreddamento ci sono nell'AHU",
+
+        # 4. Scritture esplicite corrette
+        "Imposta supply_water_setpoint del boiler a 330",
+        "Imposta supply_air_cooling_temperature_setpoint della centrale aria a 305",
+        "Imposta supply_air_damper_percentage_command di vav_room_5 a 0.5",
+        "Metti supply_air_damper_percentage_command di vav_room_20 a 0.8",
+
+        # 5. Scritture semantiche corrette
+        "Aumenta il target dell'acqua calda del boiler a 335",
+        "Porta la temperatura target di raffreddamento dell'AHU a 300",
+        "Apri la serranda della stanza 8 al 60%",
+        "Chiudi quasi del tutto la serranda della zona 9",
+        "Metti la serranda della stanza 15 a metà",
+        "Alza il setpoint dell'acqua prodotta dalla caldaia",
+        "Abbassa il setpoint di raffreddamento della centrale aria a 295",
+
+        # 6. Comandi vaghi o ambigui
+        "Fa troppo caldo nella stanza 6",
+        "Aumenta il comfort nella stanza 2",
+        "Riduci i consumi dell'aria centrale",
+        "Migliora la situazione termica dell'edificio",
+        "Ottimizza il sistema HVAC",
+        "Abbassa un po' la temperatura",
+        "Aumenta un po' l'aria",
+
+        # 7. Zone/device inesistenti
+        "Dimmi la temperatura della zona 999",
+        "Qual è la temperatura della stanza 0?",
+        "Leggi zone_air_temperature_sensor di vav_room_999",
+        "Imposta supply_air_damper_percentage_command di vav_room_999 a 0.5",
+
+        # 8. Measurement inesistenti
+        "Leggi humidity_sensor di vav_room_1",
+        "Dimmi pressure_sensor del boiler",
+        "Leggi co2_sensor della stanza 5",
+        "Qual è il livello di umidità della zona 10?",
+
+        # 9. Setpoint inesistenti
+        "Imposta humidity_setpoint della stanza 4 a 50",
+        "Imposta fan_speed_setpoint dell'AHU a 70",
+        "Imposta pressure_setpoint del boiler a 2",
+        "Accendi la luce della stanza 3",
+
+        # 10. Valori problematici
+        "Imposta supply_air_damper_percentage_command di vav_room_1 a 2",
+        "Imposta supply_air_damper_percentage_command di vav_room_1 a -0.5",
+        "Imposta supply_water_setpoint del boiler a -10",
+        "Imposta supply_air_heating_temperature_setpoint dell'AHU a abc",
+    ]
+
     #interfaccia con utente
     for i in range(steps):
         print(f"\n--- STEP {i + 1}/{steps} ---")
         user_text = input("Comando utente (INVIO per nessuna azione, 'exit' per uscire): ").strip()
+
+        #PER AUTOMATIZZARE INVIO INPUT PREDEFINITI DI TEST (commentare riga sopra)
+        '''
+        if i < len(predefined_inputs):
+            user_text = predefined_inputs[i]
+            print(f"Comando automatico: {user_text}")
+        else:
+            user_text = input("Comando utente (INVIO per nessuna azione, 'exit' per uscire): ").strip()
+        '''
 
         if user_text.lower() == "exit":
             print("Simulazione interrotta dall'utente.")
@@ -952,10 +1036,15 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
         applied_writes = []
         if user_text:
             try:
+                #chiamata a Qwen
                 result = interpreta_prompt(user_text, system_prompt, building, devices, zone_map)
-                print("Risultato function calling:", result)
+                print("Risultato function calling:")
+                for k, v in result.items():
+                    print(f"{k}: {v}")
 
+                #prendo risultato dell'interazione con Qwen salvato nel dizionario result
                 for res in result.get("writes_applied", []):
+                    #modifico setpoint tramite agente RL o override
                     record = apply_setpoint_change(env, building, user_overrides, current_action, res)
                     applied_writes.append(record)
                     print(
@@ -978,7 +1067,7 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
         if user_overrides:
             apply_user_overrides(building, user_overrides) #riapplico overrides aggiornati prima dell'avanzamento dello step
 
-        ts = env.step(current_action)
+        ts = env.step(current_action) #1.applica azione all’ambiente 2.fa avanzare la simulazione di uno step 3.restituisce il nuovo risultato della simulazione.
         apply_previous_overrides(building)
 
         r = safe_float(ts.reward)
@@ -1092,17 +1181,16 @@ if __name__ == "__main__":
     for k, v in summary.items():
         print(f"{k}: {v}")
 
-    #PER ESEGUIRE TEST DI COMPARAZIONE SU UN SETPOINT
-    """
-    quick_two_value_override_test(
+    #PER ESEGUIRE TEST DI COMPARAZIONE SU UN SETPOINT (commentare blocco sopra)
+    '''quick_two_value_override_test(
         gin_file=gin_file,
         device_prefix="air_handler",
-        setpoint_name="supply_air_cooling_temperature_setpoint",
+        setpoint_name="supply_air_heating_temperature_setpoint",
         value_a=285.0,
         value_b=305.0,
         n_steps=96,
-    )
-    """
+    )'''
+
 
 
 
