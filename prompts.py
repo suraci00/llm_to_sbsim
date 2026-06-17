@@ -646,6 +646,8 @@ def prompt_basic_withoutstructure() -> str:
             PASSO 2 - Filtra i device rilevanti
             PASSO 3 - Scegli il point corretto
             PASSO 4 - Usa il tool corretto
+            - Se l'utente vuole leggere un valore, usa read_point (anche i setpoints possono essere letti)
+            - Se l'utente vuole modificare un setpoint, usa write_point
             Struttura del sistema:
             
             """.strip()

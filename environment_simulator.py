@@ -453,8 +453,103 @@ def esegui_tools(building, devices, zone_map, tool_name: str, args: dict) -> dic
     return {"error": f"Tool sconosciuto: {tool_name}"}
 
 
+def build_context_memory_with_llm(building, devices, zone_map):
+    CONTEXT_MEMORY_PATH = "logs/llm_system_context.md" #salvataggio del file
+    discovery_prompt = """
+    Sei un assistente collegato a un simulatore HVAC.
+    Hai accesso ai tool disponibili.
+    Per costruire la struttura del sistema devi prima usare list_devices.
+    """
+
+    discovery = interpreta_prompt(
+        user_text="Usa list_devices per costruire la struttura del sistema.",
+        system_prompt=discovery_prompt,
+        building=building,
+        devices=devices,
+        zone_map=zone_map,
+    )
+
+    tool_results = discovery.get("tool_results", [])
+    if not tool_results:
+        print("[WARN] Il modello non ha chiamato nessun tool. Contesto non creato.")
+        return None
+
+    list_devices_result = None
+    for tr in tool_results:
+        if tr.get("tool_name") == "list_devices":
+            list_devices_result = tr.get("result")
+            break
+    if list_devices_result is None:
+        print("[WARN] Il modello non ha chiamato list_devices. Contesto non creato.")
+        return None
+
+    synthesis_prompt = """
+    Converti il JSON fornito in un file Markdown strutturato.
+    
+    NON spiegare il JSON.
+    NON interpretare il sistema.
+    NON aggiungere use cases.
+    NON aggiungere esempi.
+    NON aggiungere testo introduttivo.
+    
+    Devi SOLO estrarre le informazioni presenti.
+    
+    Formato obbligatorio:
+    
+    # Device
+    
+    Per ogni elemento del JSON:
+    
+    ## <device_id oppure zone_id>
+    
+    Device type:
+    <device_type>
+    
+    Setpoints:
+    - ...
+    
+    Measurements:
+    - ...
+    
+    Regole:
+    - usa solo dati presenti nel JSON
+    - non inventare componenti
+    - non usare conoscenza HVAC generale
+    - mantieni esattamente i nomi tecnici
+    """
+
+    synthesis = ollama.chat(
+        model="qwen2.5:7b",
+        messages=[
+            {"role": "system", "content": synthesis_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(list_devices_result, ensure_ascii=False),
+            },
+        ],
+        options={
+            "temperature": 0,
+            "top_p": 1,
+        },
+    )
+
+    md_content = synthesis["message"].get("content", "")
+    os.makedirs(os.path.dirname(CONTEXT_MEMORY_PATH) or ".", exist_ok=True)
+    with open(CONTEXT_MEMORY_PATH, "w", encoding="utf-8") as f:
+        f.write(md_content)
+    print(f"Contesto salvato in {CONTEXT_MEMORY_PATH}")
+    return md_content
+
+
 def build_system_prompt() -> str:
-    base_prompt = prompts.prompt_funcalling_basic()
+    base_prompt = prompts.prompt_basic_withoutstructure()
+    memory_path = "logs/llm_system_context.md"
+
+    if os.path.exists(memory_path): #se ha salvato dei file li recupera per apprendere
+        with open(memory_path, "r", encoding="utf-8") as f:
+            memory = f.read()
+        return base_prompt + "\n\n# Contesto appreso dal modello\n" + memory
+
     return base_prompt
 
 
@@ -909,6 +1004,16 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
     building = env.building
     devices = view_env(building)
     zone_map = build_zone_map(building)
+
+    memory_path = "logs/llm_system_context.md"
+    if not os.path.exists(memory_path):
+        print("Costruzione memoria incrementale del sistema...")
+        build_context_memory_with_llm(
+            building,
+            devices,
+            zone_map,
+        )
+
     system_prompt = build_system_prompt()
 
     #applico gli overrides effettuati in precedenza prima di leggere o scrivere 
@@ -1017,16 +1122,16 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
     #interfaccia con utente
     for i in range(steps):
         print(f"\n--- STEP {i + 1}/{steps} ---")
-        user_text = input("Comando utente (INVIO per nessuna azione, 'exit' per uscire): ").strip()
+        #user_text = input("Comando utente (INVIO per nessuna azione, 'exit' per uscire): ").strip()
 
         #PER AUTOMATIZZARE INVIO INPUT PREDEFINITI DI TEST (commentare riga sopra)
-        '''
+
         if i < len(predefined_inputs):
             user_text = predefined_inputs[i]
             print(f"Comando automatico: {user_text}")
         else:
             user_text = input("Comando utente (INVIO per nessuna azione, 'exit' per uscire): ").strip()
-        '''
+
 
         if user_text.lower() == "exit":
             print("Simulazione interrotta dall'utente.")
