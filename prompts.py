@@ -577,7 +577,7 @@ def prompt_funcalling_withoutrules() -> str:
 
 
 def prompt_funcalling_basic() -> str:
-    system_summary = """
+    '''system_summary = """
     Il sistema contiene tre famiglie principali di device:
 
     1. Boiler
@@ -602,6 +602,51 @@ def prompt_funcalling_basic() -> str:
 
     3. VAV
     - per ogni zona numerata zone_id_N esiste un device vav_room_N
+    - ogni vav_room_N ha:
+      - setpoint controllabile: supply_air_damper_percentage_command
+      - measurements leggibili:
+        - supply_air_damper_percentage_command
+        - supply_air_flowrate_setpoint
+        - zone_air_temperature_sensor
+    """.strip()'''
+
+    system_summary = """
+    Il sistema contiene tre famiglie principali di device.
+
+    IMPORTANTE:
+    - I nomi "Boiler", "Air Handler" e "VAV" indicano famiglie o tipologie di dispositivi, non necessariamente device_id utilizzabili direttamente nei tool.
+    - Nei tool read_point e write_point, il parametro device_id deve corrispondere esattamente a uno degli identificativi tecnici presenti nella struttura del simulatore.
+    - Se la richiesta utente contiene un nome generico o descrittivo di un dispositivo, non usarlo direttamente come device_id se non compare esattamente tra i device disponibili.
+    - Se non conosci il device_id tecnico corretto, usa prima list_devices e poi riutilizza un device_id esattamente come compare nell'osservazione.
+
+    1. Boiler
+    - indica la famiglia di dispositivi associata alla produzione di acqua calda
+    - il relativo device_id tecnico deve essere recuperato dalla struttura del simulatore
+    - si trova nella zona default_zone_id
+    - ha il setpoint controllabile: supply_water_setpoint
+    - ha measurements leggibili: heating_request_count, supply_water_setpoint, supply_water_temperature_sensor
+
+    2. Air Handler
+    - indica la famiglia di dispositivi associata alla gestione dell'aria centrale
+    - il relativo device_id tecnico deve essere recuperato dalla struttura del simulatore
+    - si trova nella zona default_zone_id
+    - ha i setpoint controllabili:
+      - supply_air_cooling_temperature_setpoint
+      - supply_air_heating_temperature_setpoint
+    - ha measurements leggibili tra cui:
+      - cooling_request_count
+      - differential_pressure_setpoint
+      - outside_air_flowrate_sensor
+      - outside_air_temperature_sensor
+      - supply_air_flowrate_sensor
+      - supply_air_cooling_temperature_setpoint
+      - supply_air_heating_temperature_setpoint
+      - supply_fan_speed_percentage_command
+
+    3. VAV
+    - indica la famiglia di dispositivi locali associati alle singole zone
+    - per ogni zona numerata zone_id_N esiste un device vav_room_N
+    - in questo caso il device_id tecnico ha forma vav_room_N
     - ogni vav_room_N ha:
       - setpoint controllabile: supply_air_damper_percentage_command
       - measurements leggibili:

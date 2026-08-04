@@ -354,7 +354,7 @@ def resolve_device_from_context(device_id, point_name, devices):
     if device_id in devices: # se ha già trovato il device -> OK
         return device_id
 
-
+    '''
     raw_device = str(device_id or "").strip().lower()
     point_name = point_name or ""
     
@@ -396,7 +396,7 @@ def resolve_device_from_context(device_id, point_name, devices):
             ]
         if len(candidates) == 1:
             return candidates[0]
-
+    '''
     return device_id
 
 
@@ -542,13 +542,13 @@ def build_context_memory_with_llm(building, devices, zone_map):
 
 
 def build_system_prompt() -> str:
-    base_prompt = prompts.prompt_basic_withoutstructure()
-    memory_path = "logs/llm_system_context.md"
+    base_prompt = prompts.prompt_funcalling_basic()
+    '''memory_path = "logs/llm_system_context.md"
 
     if os.path.exists(memory_path): #se ha salvato dei file li recupera per apprendere
         with open(memory_path, "r", encoding="utf-8") as f:
             memory = f.read()
-        return base_prompt + "\n\n# Contesto appreso dal modello\n" + memory
+        return base_prompt + "\n\n# Contesto appreso dal modello\n" + memory'''
 
     return base_prompt
 
@@ -605,6 +605,150 @@ def interpreta_prompt(user_text: str, system_prompt: str, building, devices, zon
         "final_text": None,
         "tool_results": results,
         "writes_applied": writes_applied,
+    }
+
+def interpreta_prompt_react(user_text: str, system_prompt: str, building, devices, zone_map):
+    #Versione ReAct basata su function calling. LLM -> tool call -> osservazione -> LLM -> eventuale nuova tool call
+    max_iterations = 4 # numero massimo di iterazioni del ciclo ReAct
+    react_system_prompt = system_prompt + """
+    Modalità ReAct:
+    - Rispondi sempre in italiano.
+    - Puoi usare i tool in più passaggi.
+    - Se non conosci il device_id esatto, usa prima list_devices.
+    - Dopo aver ricevuto il risultato di un tool, devi usare l'osservazione per correggere o completare la richiesta.
+    - Usa sempre device_id, measurement_name e setpoint_name esattamente come compaiono nelle osservazioni.
+    - Non inventare device, sensori o attuatori.
+    - Se un tool restituisce un errore ma fornisce una lista di valori validi, non rispondere testualmente: genera una nuova tool call usando uno dei valori validi.
+    - Se il device_id usato non esiste, ma nell'osservazione è presente un device_id valido compatibile con la richiesta utente, devi riprovare chiamando lo stesso tool con il device_id corretto.
+    - Nel caso in cui l'utente chieda il boiler e nell'osservazione sia presente un device_id che inizia con "boiler_id", usa quel device_id.
+    - Nel caso in cui l'utente chieda AHU, air handler o centrale aria e nell'osservazione sia presente un device_id che inizia con "air_handler_id", usa quel device_id.
+    - Restituisci una risposta testuale di chiarimento solo se non è possibile individuare alcun device, sensore o attuatore compatibile con la richiesta.
+    """
+
+    print("DEBUG: sto chiamando Qwen in modalità ReAct...")
+    print("DEBUG: testo utente =", user_text)
+
+    messages = [
+        {"role": "system", "content": react_system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+
+    all_results = []
+    writes_applied = []
+    final_text = None
+    last_tool_result = None
+    last_tool_name = None
+    for iteration in range(max_iterations):
+        print(f"\n[REACT] Iterazione {iteration + 1}/{max_iterations}")
+
+        t0 = time.time()
+        resp = ollama.chat(
+            model="qwen2.5:7b",
+            messages=messages,
+            tools=TOOLS,
+            options={
+                "temperature": 0,
+                "top_p": 1,
+            }
+        )
+        dt = time.time() - t0
+        print(f"[REACT] Qwen ha risposto in {dt:.2f} secondi")
+
+        message = resp["message"]
+        print("[REACT] LLM MESSAGE:", message)
+
+        tool_calls = message.get("tool_calls", [])
+
+        # salvo il messaggio
+        messages.append(message)
+
+        # Se non ci sono tool call, il modello ha concluso
+        if not tool_calls:
+            final_text = message.get("content", "")
+
+            if iteration < max_iterations - 1:
+                # Caso 1: l'ultimo tool ha prodotto un errore correggibile
+                if isinstance(last_tool_result, dict) and "error" in last_tool_result:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "La risposta testuale non conclude correttamente il task. "
+                            "Usa l'ultima osservazione del tool per generare una nuova tool call corretta. "
+                            "Non chiedere chiarimenti se nell'osservazione sono presenti device_id, "
+                            "measurement_name o setpoint_name compatibili con la richiesta originale. "
+                            "Rispondi sempre in italiano."
+                        )
+                    })
+                    continue
+
+                # Caso 2: il modello ha appena usato list_devices, ma non ha ancora eseguito la lettura o scrittura richiesta dall'utente
+                if last_tool_name == "list_devices":
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "La risposta testuale non conclude il task originale. "
+                            "Hai usato list_devices solo per osservare la struttura del sistema. "
+                            "Ora devi usare le informazioni osservate per generare una nuova tool call operativa. "
+                            "Se la richiesta originale chiedeva di leggere un valore, chiama read_point. "
+                            "Se chiedeva di modificare un valore, chiama write_point. "
+                            "Usa device_id, measurement_name e setpoint_name esattamente come compaiono nell'osservazione. "
+                            "Non riassumere la struttura del sistema. "
+                            "Rispondi sempre in italiano."
+                        )
+                    })
+                    continue
+
+            break
+
+        for tc in tool_calls:
+            fn = tc["function"]["name"]
+            args = tc["function"].get("arguments", {})
+            print(f"[REACT] Tool chiamato: {fn}")
+            print(f"[REACT] Argomenti: {args}")
+
+            result = esegui_tools(
+                building=building,
+                devices=devices,
+                zone_map=zone_map,
+                tool_name=fn,
+                args=args,
+            )
+            last_tool_result = result
+            last_tool_name = fn
+            if fn == "write_point" and isinstance(result, dict):
+                if result.get("response_type") == 1:
+                    result["success"] = True
+                    writes_applied.append(result)
+                else:
+                    result["success"] = False
+            record = {
+                "iteration": iteration + 1,
+                "tool_name": fn,
+                "arguments": args,
+                "result": result,
+            }
+            all_results.append(record)
+            observation = {
+                            "tool_name": fn,
+                            "result": result,
+                          }
+
+            # Messaggio tool per il ciclo successivo
+            messages.append({
+                "role": "tool",
+                "content": json.dumps(observation, ensure_ascii=False),
+            })
+            print("[REACT] Osservazione:", observation)
+
+        # Se è già stata applicata una scrittura valida, possiamo fermarci
+        if writes_applied:
+            break
+
+    return {
+        "final_text": final_text,
+        "tool_results": all_results,
+        "writes_applied": writes_applied,
+        "react_tool_calls": len(all_results),
     }
 
 
@@ -1005,14 +1149,14 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
     devices = view_env(building)
     zone_map = build_zone_map(building)
 
-    memory_path = "logs/llm_system_context.md"
+    '''memory_path = "logs/llm_system_context.md"
     if not os.path.exists(memory_path):
         print("Costruzione memoria incrementale del sistema...")
         build_context_memory_with_llm(
             building,
             devices,
             zone_map,
-        )
+        )'''
 
     system_prompt = build_system_prompt()
 
@@ -1040,8 +1184,18 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
     total_electricity_kwh = 0.0
     total_gas_kwh = 0.0
     sum_avg_temp_c = 0.0
+    '''predefined_inputs_restricted = ["Mostrami tutti i device disponibili",
+    "Quali sensori sono disponibili nel sistema?",
+    "Dimmi temperatura zona 10",
+    "Qual è la temperatura nella stanza 25?",
+    "Dimmi il valore del sensore di temperatura in zona 3",
+    "Leggi supply_air_flowrate_setpoint del device vav_room_7",
+    "Imposta apertura serranda della stanza 10 a 0.5",
+    "Apri la serranda della zona 10 al 70 percento",
+    "Imposta la temperatura di mandata dell'aria a 30 gradi",
+    "Aumenta la temperatura dell'acqua a 320"]'''
 
-    predefined_inputs = [
+    '''predefined_inputs = [
         # 1. Discovery generale
         "Quali device sono disponibili nel sistema?",
         "Quali sensori sono disponibili nel sistema?",
@@ -1117,20 +1271,20 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
         "Imposta supply_air_damper_percentage_command di vav_room_1 a -0.5",
         "Imposta supply_water_setpoint del boiler a -10",
         "Imposta supply_air_heating_temperature_setpoint dell'AHU a abc",
-    ]
+    ]'''
 
     #interfaccia con utente
     for i in range(steps):
         print(f"\n--- STEP {i + 1}/{steps} ---")
-        #user_text = input("Comando utente (INVIO per nessuna azione, 'exit' per uscire): ").strip()
+        user_text = input("Comando utente (INVIO per nessuna azione, 'exit' per uscire): ").strip()
 
         #PER AUTOMATIZZARE INVIO INPUT PREDEFINITI DI TEST (commentare riga sopra)
-
+        '''
         if i < len(predefined_inputs):
             user_text = predefined_inputs[i]
             print(f"Comando automatico: {user_text}")
         else:
-            user_text = input("Comando utente (INVIO per nessuna azione, 'exit' per uscire): ").strip()
+            user_text = input("Comando utente (INVIO per nessuna azione, 'exit' per uscire): ").strip()'''
 
 
         if user_text.lower() == "exit":
@@ -1142,7 +1296,7 @@ def simulate_one_day(env, out_csv: str) -> Dict[str, Any]:
         if user_text:
             try:
                 #chiamata a Qwen
-                result = interpreta_prompt(user_text, system_prompt, building, devices, zone_map)
+                result = interpreta_prompt_react(user_text, system_prompt, building, devices, zone_map)
                 print("Risultato function calling:")
                 for k, v in result.items():
                     print(f"{k}: {v}")
